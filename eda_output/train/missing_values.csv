@@ -1,0 +1,45 @@
+,missing_count,missing_pct,group,notes
+final_recovered_amount,76316,89.43,outcome,Dollars recovered after a default. Null otherwise.
+days_to_default,76316,89.43,outcome,"Day in [1,90] on which the loan first met a default condition. Null if it did not default."
+days_since_last_external_decline,42835,50.19,bureau_credit,Days since the applicant was last declined by another lender. Null if no recorded prior external decline.
+days_to_full_repayment,42642,49.97,outcome,Day on which the loan was fully repaid. Null if it defaulted or has not matured.
+days_since_last_inquiry_elsewhere,42605,49.92,application_context,Days since the last inquiry to another lender. Null if none recorded.
+observation_status,33618,39.39,outcome,Whether the loan has matured or is still censored (not yet fully observed).
+repayment_status,33618,39.39,outcome,"Observed end state: paid_in_full, defaulted, or open."
+default_flag,33618,39.39,outcome,"Whether the loan defaulted. Default triggers on any of: 3 consecutive missed daily draws, 6 cumulative missed draws, or a positive outstanding balance at day 90 (see README). Present only for prior-approved and matured loans; null for declined or immature loans."
+prior_approved_amount,33618,39.39,prior_underwriter,Amount the prior underwriter approved (may differ from requested). Null if declined.
+observed_revenue_volatility,30453,35.68,bank_feed,Revenue volatility from the bank feed. Null if no linked feed.
+payroll_regularity_score,30453,35.68,bank_feed,Score for how regular payroll outflows are (higher = more regular). Null if no linked feed.
+observed_overdraft_count_3mo,30453,35.68,bank_feed,Count of overdraft events in the last 3 months from the bank feed. Null if no linked feed.
+observed_cash_balance_p10,30453,35.68,bank_feed,10th-percentile daily cash balance from the bank feed (dollars; can be negative). Null if no linked feed.
+observed_revenue_trend_3mo,30453,35.68,bank_feed,Recent revenue trend from the bank feed. Null if no linked feed.
+observed_monthly_revenue_avg_3mo,30453,35.68,bank_feed,Average monthly revenue over the last 3 months from the linked bank feed (dollars). Null if no linked feed.
+prior_loans_count,0,0.0,platform_engagement,Number of prior loans this business took with this lender before this application.
+requested_amount_to_observed_revenue,0,0.0,application_context,Engineered ratio of requested amount to observed monthly revenue.
+repeat_application_count,0,0.0,application_context,How many times this business has previously applied with this lender.
+prior_underwriter_score,0,0.0,prior_underwriter,Score the prior underwriting system assigned to this application (its model is not provided).
+multi_lender_inquiry_count_30d,0,0.0,application_context,Number of near-simultaneous inquiries to multiple lenders in the last 30 days.
+application_channel,0,0.0,application_context,Integer-coded acquisition channel for the application.
+prior_decision,0,0.0,prior_underwriter,The prior underwriter decision: approved or declined. Outcomes are observed only for approved applications.
+application_timestamp,0,0.0,application_context,Date/time of the application. Determines which cohort_week an application belongs to.
+prior_loans_amount_total,0,0.0,platform_engagement,Total dollars borrowed across prior loans with this lender.
+prior_loans_default_count,0,0.0,platform_engagement,Number of those prior loans that defaulted (at most prior_loans_count).
+business_id,0,0.0,business_identity,Stable identifier for a business. A business may submit more than one application; businesses never span more than one of train/validation/test.
+invoice_payment_delinquency_rate,0,0.0,platform_engagement,Rate of late invoice payments (0-1).
+bookkeeping_recency_days,0,0.0,platform_engagement,Days since the last bookkeeping activity.
+sector,0,0.0,business_identity,Integer-coded industry sector. Codes are anonymized (0..N-1) and carry no real-world sector name.
+geography_region,0,0.0,business_identity,Integer-coded geography bucket.
+vintage_years,0,0.0,business_identity,Age of the business in years.
+employee_count_bucket,0,0.0,business_identity,Integer-coded company size bucket (smaller code = fewer employees).
+stated_annual_revenue,0,0.0,self_reported,Annual revenue as reported by the applicant on the application.
+stated_time_in_business,0,0.0,self_reported,Time in business in years as reported by the applicant.
+requested_amount,0,0.0,self_reported,Loan amount requested by the applicant in dollars (product range roughly $5K-$50K).
+intended_use_of_funds,0,0.0,self_reported,Integer-coded stated purpose of the loan.
+has_linked_bank_feed,0,0.0,bank_feed,Whether the applicant linked a bank feed. Bank-feed columns are null when this is false.
+aggregate_credit_utilization,0,0.0,bureau_credit,Aggregate credit utilization ratio from the credit bureau (0-1).
+recent_inquiries_count_6mo,0,0.0,bureau_credit,Number of credit inquiries in the last 6 months.
+existing_debt_obligations,0,0.0,bureau_credit,Existing debt obligations in dollars.
+owner_personal_credit_band,0,0.0,bureau_credit,Integer-coded band for the owner's personal credit.
+applicant_id,0,0.0,business_identity,Unique identifier for a single application. Use this to join your submissions.
+platform_active_months,0,0.0,platform_engagement,Number of months of active platform use.
+account_age_days,0,0.0,platform_engagement,Days the applicant has been on the platform.
