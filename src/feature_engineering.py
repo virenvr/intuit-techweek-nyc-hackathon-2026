@@ -7,7 +7,7 @@ import pandas as pd
 
 from src.constants import APR, TERM_DAYS
 
-# Raw columns used directly in the PD / recovery models.
+# Raw columns used directly in the PD / recovery models (excluding prior-lender score).
 RAW_NUMERIC_FEATURES = [
     "requested_amount",
     "stated_annual_revenue",
@@ -21,7 +21,6 @@ RAW_NUMERIC_FEATURES = [
     "prior_loans_default_count",
     "repeat_application_count",
     "requested_amount_to_observed_revenue",
-    "prior_underwriter_score",
     "observed_monthly_revenue_avg_3mo",
     "observed_cash_balance_p10",
     "payroll_regularity_score",
@@ -29,6 +28,9 @@ RAW_NUMERIC_FEATURES = [
     "observed_revenue_trend_3mo",
     "observed_revenue_volatility",
 ]
+
+# Optional: encodes the *previous* lender policy — ablated by default (see train_models).
+PRIOR_LENDER_FEATURES = ["prior_underwriter_score"]
 
 RAW_CATEGORICAL_FEATURES = [
     "sector",
@@ -54,12 +56,19 @@ ENGINEERED_FEATURES = [
     "external_decline_recency",
 ]
 
-FEATURE_COLUMNS = (
-    RAW_NUMERIC_FEATURES
-    + RAW_CATEGORICAL_FEATURES
-    + RAW_BOOLEAN_FEATURES
-    + ENGINEERED_FEATURES
-)
+DEFAULT_NO_DECLINE_SENTINEL = 9999.0
+
+
+def feature_columns(*, include_prior_underwriter_score: bool = False) -> list[str]:
+    """Application-time feature list for modeling."""
+    numeric = list(RAW_NUMERIC_FEATURES)
+    if include_prior_underwriter_score:
+        numeric = numeric + list(PRIOR_LENDER_FEATURES)
+    return numeric + RAW_CATEGORICAL_FEATURES + RAW_BOOLEAN_FEATURES + ENGINEERED_FEATURES
+
+
+# Default feature set (no prior-lender score).
+FEATURE_COLUMNS = feature_columns(include_prior_underwriter_score=False)
 
 
 def daily_draw(requested_amount: pd.Series | np.ndarray) -> pd.Series | np.ndarray:
@@ -115,9 +124,6 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     ).abs()
 
     return out
-
-
-DEFAULT_NO_DECLINE_SENTINEL = 9999.0
 
 
 def approved_matured_mask(df: pd.DataFrame) -> pd.Series:

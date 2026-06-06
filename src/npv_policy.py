@@ -1,64 +1,11 @@
-"""Expected NPV and approve/decline policy for Deliverable A.
-
-Optimization objective (portfolio level)
----------------------------------------
-We choose decisions d_i in {0, 1} to maximize expected portfolio profit:
-
-    max_{d}  E[ sum_i  d_i * NPV_i ]
-
-Per-loan decision rule (equivalent for independent loans)
----------------------------------------------------------
-Approve borrower i iff expected net present value is positive:
-
-    decision_i = 1  if  E[NPV_i | approve, x_i] > 0
-    decision_i = 0  otherwise
-
-Expected NPV decomposition
---------------------------
-Let:
-    R_i  = requested_amount
-    r    = 0.35  (APR)
-    T    = 60    (term in days)
-    F_i  = 0.03 * R_i                         (origination fee, collected upfront)
-    L_i  = R_i * (1 + r*T/365)                (total scheduled repayment)
-    D_i  = L_i / T                            (daily ACH draw)
-    p_i  = P(default | x_i)                   (predicted PD)
-    t_i  = E[days_to_default | default, x_i]  (expected default day)
-    rec_i = E[recovery | default, x_i]        (expected dollars recovered)
-
-If the loan repays in full:
-    NPV_i^repay = F_i + L_i - R_i = F_i + R_i * r * T / 365
-
-If the loan defaults on day t with recovery rec:
-    NPV_i^def = F_i + t * D_i + rec - R_i
-
-Expected NPV:
-    E[NPV_i] = (1 - p_i) * NPV_i^repay + p_i * NPV_i^def
-
-Variables used in the decision
-------------------------------
-From the applicant record x_i:
-    - requested_amount (R_i): loan size, drives fee, draws, and loss
-    - predicted PD p_i from gradient-boosted model using application features
-    - expected default day t_i (mean from training defaults, optionally adjusted)
-    - expected recovery rec_i from gradient-boosted recovery model on defaults
-
-PD model inputs (see feature_engineering.py):
-    payment behavior: invoice_payment_delinquency_rate
-    liquidity: observed_cash_balance_p10, payroll_regularity_score
-    credit stress: aggregate_credit_utilization, existing_debt_obligations
-    affordability ratios: requested_amount_to_observed_revenue, daily_draw_burden
-    bureau / history: owner_personal_credit_band, prior_loans_default_count, inquiries
-    business context: sector, geography_region, employee_count_bucket, etc.
-"""
+"""Expected NPV and approve/decline policy for Deliverable A."""
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-from src.constants import APR, ORIGINATION_FEE_RATE, TERM_DAYS
-from src.feature_engineering import daily_draw
+from src.constants import APR, DEFAULT_WINDOW_DAYS, ORIGINATION_FEE_RATE, TERM_DAYS
 
 
 def loan_cashflows(requested_amount: pd.Series | np.ndarray) -> dict[str, np.ndarray]:
@@ -90,8 +37,8 @@ def npv_if_default(
     """NPV when the borrower defaults on default_day with recovery_amount collected."""
     cf = loan_cashflows(requested_amount)
     r = np.asarray(requested_amount, dtype=float)
-    t = np.asarray(default_day, dtype=float)
-    rec = np.asarray(recovery_amount, dtype=float)
+    t = np.clip(np.asarray(default_day, dtype=float), 1.0, float(DEFAULT_WINDOW_DAYS))
+    rec = np.maximum(np.asarray(recovery_amount, dtype=float), 0.0)
     payments_collected = t * cf["daily_draw"]
     return cf["origination_fee"] + payments_collected + rec - r
 
@@ -109,6 +56,60 @@ def expected_npv(
     return (1.0 - p) * npv_repay + p * npv_def
 
 
-def approval_decision(expected_npv_values: pd.Series | np.ndarray) -> np.ndarray:
-    """Approve iff E[NPV] > 0."""
-    return (np.asarray(expected_npv_values, dtype=float) > 0.0).astype(int)
+def approval_decision(
+    expected_npv_values: pd.Series | np.ndarray,
+    *,
+    npv_threshold: float = 0.0,
+) -> np.ndarray:
+    """Approve iff E[NPV] > npv_threshold (threshold tuned on validation profit)."""
+    return (np.asarray(expected_npv_values, dtype=float) > npv_threshold).astype(int)
+
+
+def realized_npv(df: pd.DataFrame) -> np.ndarray:
+    """Observed NPV for matured rows using actual outcomes (validation tuning only)."""
+    amount = df["requested_amount"].to_numpy(dtype=float)
+    defaulted = df["default_flag"].astype(bool).to_numpy()
+    npv = np.zeros(len(df), dtype=float)
+    if (~defaulted).any():
+        npv[~defaulted] = npv_if_repaid(amount[~defaulted])
+    if defaulted.any():
+        default_day = df.loc[defaulted, "days_to_default"].fillna(DEFAULT_WINDOW_DAYS)
+        recovery = df.loc[defaulted, "final_recovered_amount"].fillna(0.0)
+        npv[defaulted] = npv_if_default(
+            amount[defaulted],
+            default_day.to_numpy(),
+            recovery.to_numpy(),
+        )
+    return npv
+
+
+def portfolio_realized_profit(df: pd.DataFrame, decisions: np.ndarray) -> float:
+    """Sum of realized NPV on approved rows (requires outcome columns)."""
+    d = np.asarray(decisions, dtype=int)
+    realized = realized_npv(df)
+    return float((d * realized).sum())
+
+
+def tune_npv_threshold(
+    df: pd.DataFrame,
+    expected_npv_values: np.ndarray,
+    *,
+    thresholds: np.ndarray | None = None,
+) -> tuple[float, float]:
+    """Pick threshold maximizing realized portfolio profit on labeled validation rows."""
+    if thresholds is None:
+        enpv = np.asarray(expected_npv_values, dtype=float)
+        lo = float(np.quantile(enpv, 0.05))
+        hi = float(np.quantile(enpv, 0.95))
+        thresholds = np.linspace(lo, hi, 41)
+
+    enpv = np.asarray(expected_npv_values, dtype=float)
+    best_tau = 0.0
+    best_profit = -np.inf
+    for tau in thresholds:
+        decisions = approval_decision(enpv, npv_threshold=float(tau))
+        profit = portfolio_realized_profit(df, decisions)
+        if profit > best_profit:
+            best_profit = profit
+            best_tau = float(tau)
+    return best_tau, best_profit

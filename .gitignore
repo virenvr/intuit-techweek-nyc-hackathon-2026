@@ -1,26 +1,77 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyo
+*.egg
 *.egg-info/
+dist/
+build/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
 
-# Virtual env
+# Virtual environments (never commit — use requirements.txt)
 .venv/
 venv/
+env/
+ENV/
+dobby/
 
 # uv
-# (uv.lock IS committed)
+# (uv.lock IS committed if present)
 
-# Generated artifacts (large; reproducible from config)
-artifacts/release/
-artifacts/ground_truth/
-artifacts/runs/
+# Large extracted dataset (keep dataset/dataset-compressed.zip only; unzip locally)
+dataset/dataset-compressed/
+
+# EDA / notebook outputs (regenerable)
+eda_output/
+notebooks/output/
+reports/figures/
+
+# Generated submission files (regenerable from src/)
+submission/*
+!submission/.gitkeep
+
+# Model & data artifacts
 artifacts/
+*.pkl
+*.pickle
+*.joblib
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.onnx
+*.cbm
+
+# Logs & temp
+*.log
+*.tmp
+*.temp
+.cache/
+
+# Local backups / scratch
+*.local.backup.*
+goals.local.backup.MD
+scratch/
+tmp/
 
 # OS
 .DS_Store
+**/.DS_Store
+__MACOSX/
+**/__MACOSX/
+Thumbs.db
+desktop.ini
 
-# Editor
+# Editor / IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+.cursor/
