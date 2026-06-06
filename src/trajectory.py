@@ -1,11 +1,23 @@
 """Default timing trajectories for Deliverable B (Steps 3-7).
 
-v1 contract
+v2 contract
 -----------
-- Train discrete-time default-by-day-7a classifiers on approved+matured history.
+- Train ONE discrete-time hazard model on approved+matured history (person-period
+  expansion, loan age as a feature) instead of 13 independent per-age classifiers.
+  CDR is rebuilt as 1 - prod(1 - hazard), which is smooth and monotone by
+  construction and removes the "flat tail then age-13 spike" artifact.
 - Aggregate to cohort-level CDR using Deliverable A approve decisions.
 - Failsafe to historical Kaplan-Meier curves when a cohort has too few approvals.
-- Enforce monotone cumulative rates; attach simple binomial 90% intervals.
+- Attach intervals that actually reflect uncertainty: a binomial sampling term
+  (cohort size), a Greenwood shape term (grows as the at-risk set thins with age),
+  and an extrapolation inflation that grows past the observed boundary 14 - w.
+
+NOTE: this preserves the public interface used by run_deliverable_b.py
+(`train_trajectory_models`, `build_trajectory_grid`, `merge_decisions`,
+`TrajectoryModels`) and the same column / constant / feature_engineering
+assumptions as v1 (`default_flag`, `days_to_default`, the feature lists, etc.).
+It has not been run against the real data here — run it on train/validation and
+re-check validate_submission.py.
 """
 
 from __future__ import annotations
@@ -78,42 +90,119 @@ def _build_preprocessor(feature_cols: list[str]) -> ColumnTransformer:
     )
 
 
-def _default_by_day_label(df: pd.DataFrame, day: int) -> np.ndarray:
-    """1 if loan defaulted on or before `day`, else 0 (approved+matured rows only)."""
-    defaulted = df["default_flag"].astype(bool).to_numpy()
-    days = df["days_to_default"].to_numpy(dtype=float)
-    return (defaulted & (days <= day)).astype(int)
-
-
 @dataclass
 class TrajectoryModels:
-    """Timing models + historical cohort KM failsafes."""
+    """Single discrete-time hazard model + historical cohort KM failsafes."""
 
-    age_models: list[Pipeline]
+    prep: ColumnTransformer
+    clf: HistGradientBoostingClassifier
     feature_cols: list[str]
+    greenwood_var: np.ndarray  # length N_LOAN_AGE_WEEKS: Var(CDR(a)) shape term
     cohort_km_cdr: dict[int, np.ndarray] = field(default_factory=dict)
     global_km_cdr: np.ndarray = field(default_factory=lambda: np.zeros(N_LOAN_AGE_WEEKS))
     min_approved_cohort_size: int = MIN_APPROVED_COHORT_SIZE
     blend_weight: float = 0.35  # weight on historical KM when cohort is small (tunable)
+    extrap_inflation_per_week: float = 0.15  # widen bands past observed boundary (tunable)
+
+
+# ----------------------------------------------------------------------------
+# Hazard model (replaces the 13 independent per-age classifiers)
+# ----------------------------------------------------------------------------
+
+
+def _person_period(
+    history: pd.DataFrame, feature_cols: list[str]
+) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Expand each matured loan into at-risk weekly intervals (discrete-time).
+
+    For loan i and week k (1..13): the loan is *at risk* if it had not defaulted
+    before the start of the interval (day 7*(k-1)); the *event* is whether it
+    defaulted within (7*(k-1), 7*k]. Loans drop out of the risk set after default.
+
+    Returns the stacked feature frame, the age vector, the event labels, and the
+    per-week (at_risk_count, event_count) arrays used for the Greenwood variance.
+    """
+    feats = build_features(history)[feature_cols].reset_index(drop=True)
+    defaulted = history["default_flag"].astype(bool).to_numpy()
+    raw_days = history["days_to_default"].to_numpy(dtype=float)
+    # Day of default; +inf for loans that never defaulted within the window.
+    eff_day = np.where(defaulted, raw_days, np.inf)
+
+    frames: list[pd.DataFrame] = []
+    age_chunks: list[np.ndarray] = []
+    label_chunks: list[np.ndarray] = []
+    n_at_risk = np.zeros(N_LOAN_AGE_WEEKS)
+    n_events = np.zeros(N_LOAN_AGE_WEEKS)
+
+    for k in range(1, N_LOAN_AGE_WEEKS + 1):
+        lo = loan_age_to_day(k - 1)
+        hi = loan_age_to_day(k)
+        at_risk = eff_day > lo  # survived to the start of interval k
+        event = at_risk & defaulted & (eff_day <= hi)
+
+        n_at_risk[k - 1] = int(at_risk.sum())
+        n_events[k - 1] = int(event.sum())
+        if not at_risk.any():
+            continue
+
+        frames.append(feats.loc[at_risk])
+        age_chunks.append(np.full(int(at_risk.sum()), k, dtype=float))
+        label_chunks.append(event[at_risk].astype(int))
+
+    x_feat = pd.concat(frames, ignore_index=True)
+    age_arr = np.concatenate(age_chunks)
+    y = np.concatenate(label_chunks)
+    return x_feat, age_arr, y, n_at_risk, n_events
+
+
+def _greenwood_variance(n_at_risk: np.ndarray, n_events: np.ndarray) -> np.ndarray:
+    """Greenwood-style Var(CDR(a)) from training risk-set counts.
+
+    Var(S(a)) = S(a)^2 * sum_{k<=a} d_k / (n_k (n_k - d_k)); Var(CDR)=Var(S).
+    Grows as the at-risk set thins at later ages -> wider bands at the tail.
+    """
+    haz = np.divide(
+        n_events, n_at_risk, out=np.zeros_like(n_events), where=n_at_risk > 0
+    )
+    surv = np.cumprod(1.0 - haz)
+    denom = n_at_risk * (n_at_risk - n_events)
+    term = np.divide(n_events, denom, out=np.zeros_like(n_events), where=denom > 0)
+    return (surv ** 2) * np.cumsum(term)
+
+
+def _individual_cdr_matrix(models: TrajectoryModels, df: pd.DataFrame) -> np.ndarray:
+    """Per-row CDR curve over ages 1..13: shape (n_rows, N_LOAN_AGE_WEEKS)."""
+    feats = _feature_matrix(df, models.feature_cols)
+    x_prep = models.prep.transform(feats)
+    n = x_prep.shape[0]
+    hazards = np.zeros((n, N_LOAN_AGE_WEEKS))
+    for k in range(1, N_LOAN_AGE_WEEKS + 1):
+        x_age = np.hstack([x_prep, np.full((n, 1), float(k))])
+        hazards[:, k - 1] = models.clf.predict_proba(x_age)[:, 1]
+    survival = np.cumprod(1.0 - hazards, axis=1)
+    return 1.0 - survival
+
+
+def predict_individual_cdr(models: TrajectoryModels, df: pd.DataFrame, age: int) -> np.ndarray:
+    """P(default by day 7*age | x) for each row (kept for interface compatibility)."""
+    return _individual_cdr_matrix(models, df)[:, age - 1]
+
+
+# ----------------------------------------------------------------------------
+# Historical Kaplan-Meier failsafes (unchanged from v1)
+# ----------------------------------------------------------------------------
 
 
 def _kaplan_meier_cdr(days: np.ndarray, defaulted: np.ndarray, eval_days: list[int]) -> np.ndarray:
-    """Empirical KM: CDR(t) = P(default by day t) for simple v1 historical curves."""
+    """Empirical CDR(t) = P(default by day t) for simple historical curves."""
     days = np.asarray(days, dtype=float)
     defaulted = np.asarray(defaulted, dtype=bool)
-    n = len(days)
-    if n == 0:
+    if len(days) == 0:
         return np.zeros(len(eval_days))
-
-    cdrs = []
-    for t in eval_days:
-        cdrs.append(float(np.mean(defaulted & (days <= t))))
-    return np.array(cdrs)
+    return np.array([float(np.mean(defaulted & (days <= t))) for t in eval_days])
 
 
-def _fit_historical_km(
-    history: pd.DataFrame,
-) -> tuple[dict[int, np.ndarray], np.ndarray]:
+def _fit_historical_km(history: pd.DataFrame) -> tuple[dict[int, np.ndarray], np.ndarray]:
     """Per-cohort and global KM curves at loan ages 1..13."""
     eval_days = [loan_age_to_day(a) for a in range(1, N_LOAN_AGE_WEEKS + 1)]
     matured = history.loc[approved_matured_mask(history)].copy()
@@ -144,69 +233,65 @@ def train_trajectory_models(
     *,
     include_prior_underwriter_score: bool = False,
 ) -> TrajectoryModels:
-    """Train one classifier per loan-age checkpoint (Steps 3-4)."""
+    """Train a single discrete-time hazard model (Steps 3-4)."""
     feature_cols = feature_columns(
         include_prior_underwriter_score=include_prior_underwriter_score
     )
     history = train.loc[approved_matured_mask(train)].copy()
-    x_train = _feature_matrix(history, feature_cols)
 
-    age_models: list[Pipeline] = []
-    for age in range(1, N_LOAN_AGE_WEEKS + 1):
-        day = loan_age_to_day(age)
-        y = _default_by_day_label(history, day)
-        model = Pipeline(
-            steps=[
-                ("prep", _build_preprocessor(feature_cols)),
-                (
-                    "clf",
-                    HistGradientBoostingClassifier(
-                        max_depth=5,
-                        learning_rate=0.08,
-                        max_iter=120,
-                        random_state=42 + age,
-                    ),
-                ),
-            ]
-        )
-        model.fit(x_train, y)
-        age_models.append(model)
+    # Person-period expansion -> one hazard model with loan age as a feature.
+    x_feat, age_arr, y, n_at_risk, n_events = _person_period(history, feature_cols)
+    prep = _build_preprocessor(feature_cols).fit(_feature_matrix(history, feature_cols))
+    x_long = np.hstack([prep.transform(x_feat), age_arr.reshape(-1, 1)])
+
+    clf = HistGradientBoostingClassifier(
+        max_depth=5,
+        learning_rate=0.08,
+        max_iter=200,
+        random_state=42,
+    )
+    clf.fit(x_long, y)
+
+    greenwood_var = _greenwood_variance(n_at_risk, n_events)
 
     # Cohort KM from validation (falls in cohort windows); train is pre-cohort history.
     km_source = validation if validation is not None else train
     cohort_km, global_km = _fit_historical_km(km_source)
+
     return TrajectoryModels(
-        age_models=age_models,
+        prep=prep,
+        clf=clf,
         feature_cols=feature_cols,
+        greenwood_var=greenwood_var,
         cohort_km_cdr=cohort_km,
         global_km_cdr=global_km,
     )
 
 
-def predict_individual_cdr(models: TrajectoryModels, df: pd.DataFrame, age: int) -> np.ndarray:
-    """P(default by day 7*age | x) for each row."""
-    idx = age - 1
-    x = _feature_matrix(df, models.feature_cols)
-    return models.age_models[idx].predict_proba(x)[:, 1]
+# ----------------------------------------------------------------------------
+# Intervals + monotonicity
+# ----------------------------------------------------------------------------
 
 
-def _historical_cdr(models: TrajectoryModels, cohort_week: int, age: int) -> float:
-    idx = age - 1
-    if cohort_week in models.cohort_km_cdr:
-        return float(models.cohort_km_cdr[cohort_week][idx])
-    return float(models.global_km_cdr[idx])
+def _interval(
+    rate: float,
+    n: int,
+    age: int,
+    cohort_week: int,
+    models: TrajectoryModels,
+) -> tuple[float, float]:
+    """90% interval: binomial sampling + Greenwood shape + extrapolation inflation."""
+    n_eff = max(int(n), 1)
+    var_binom = max(rate * (1.0 - rate), 0.0) / n_eff
+    var_shape = float(models.greenwood_var[age - 1])
+    half = INTERVAL_Z_SCORE * np.sqrt(var_binom + var_shape)
 
+    # Weeks of forecast past the observed boundary (cohort w observed to age 14-w).
+    extrap_weeks = max(0, age - (N_COHORT_WEEKS + 1 - cohort_week))
+    half *= 1.0 + models.extrap_inflation_per_week * extrap_weeks
 
-def _binomial_interval(rate: float, n: int) -> tuple[float, float]:
-    """Simple normal-approx 90% interval for a proportion (v1; tune later)."""
-    if n <= 0:
-        half = 0.5
-    else:
-        se = np.sqrt(max(rate * (1.0 - rate), 0.0) / n)
-        half = max(MIN_INTERVAL_HALF_WIDTH, INTERVAL_Z_SCORE * se)
-    lower = np.clip(rate - half, 0.0, 1.0)
-    upper = np.clip(rate + half, 0.0, 1.0)
-    return float(lower), float(upper)
+    half = max(MIN_INTERVAL_HALF_WIDTH, half)
+    return float(np.clip(rate - half, 0.0, 1.0)), float(np.clip(rate + half, 0.0, 1.0))
 
 
 def enforce_monotone_cohort(curve: pd.DataFrame) -> pd.DataFrame:
@@ -214,8 +299,8 @@ def enforce_monotone_cohort(curve: pd.DataFrame) -> pd.DataFrame:
     out = curve.sort_values("loan_age_weeks").copy()
     out["cumulative_default_rate"] = out["cumulative_default_rate"].cummax()
 
-    lowers = []
-    uppers = []
+    lowers: list[float] = []
+    uppers: list[float] = []
     running_lower = 0.0
     running_upper = 0.0
     for _, row in out.iterrows():
@@ -223,8 +308,7 @@ def enforce_monotone_cohort(curve: pd.DataFrame) -> pd.DataFrame:
         lo = min(float(row["cdr_lower_90"]), rate)
         hi = max(float(row["cdr_upper_90"]), rate)
         running_lower = max(running_lower, lo)
-        running_upper = max(running_upper, hi)
-        running_upper = max(running_upper, running_lower)
+        running_upper = max(running_upper, hi, running_lower)
         lowers.append(running_lower)
         uppers.append(running_upper)
 
@@ -235,38 +319,43 @@ def enforce_monotone_cohort(curve: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _cohort_curve(
+    models: TrajectoryModels, members: pd.DataFrame, cohort_week: int
+) -> np.ndarray:
+    """Length-13 CDR curve for a cohort, with thin/empty KM failsafes."""
+    n_approved = len(members)
+    hist = models.cohort_km_cdr.get(cohort_week, models.global_km_cdr)
+
+    if n_approved == 0:
+        return np.asarray(hist, dtype=float)
+
+    portfolio = _individual_cdr_matrix(models, members).mean(axis=0)
+    if n_approved < models.min_approved_cohort_size:
+        bw = models.blend_weight
+        return (1.0 - bw) * portfolio + bw * np.asarray(hist, dtype=float)
+    return portfolio
+
+
 def build_trajectory_grid(
     models: TrajectoryModels,
     scoring_df: pd.DataFrame,
     template: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Steps 2, 5, 7: fill 169-row grid from A decisions + timing models."""
-    grid = template.copy()
-    rows: list[dict[str, float | int]] = []
+    """Steps 2, 5, 7: fill the 169-row grid from A decisions + the hazard model."""
+    _ = template  # grid is rebuilt deterministically below; template kept for the API
+    out_parts: list[pd.DataFrame] = []
 
     for w in range(1, N_COHORT_WEEKS + 1):
-        cohort_members = scoring_df[
+        members = scoring_df[
             (scoring_df["cohort_week"] == w) & (scoring_df["decision"] == 1)
         ]
-        n_approved = len(cohort_members)
+        n_approved = len(members)
+        curve = _cohort_curve(models, members, w)
 
+        rows: list[dict[str, float | int]] = []
         for age in range(1, N_LOAN_AGE_WEEKS + 1):
-            hist = _historical_cdr(models, w, age)
-
-            if n_approved == 0:
-                # Failsafe: no approvals in cohort -> pure historical KM
-                rate = hist
-            elif n_approved < models.min_approved_cohort_size:
-                # Failsafe: thin cohort -> blend portfolio mean with historical KM
-                indiv = predict_individual_cdr(models, cohort_members, age)
-                portfolio = float(np.mean(indiv))
-                bw = models.blend_weight
-                rate = (1.0 - bw) * portfolio + bw * hist
-            else:
-                indiv = predict_individual_cdr(models, cohort_members, age)
-                rate = float(np.mean(indiv))
-
-            lower, upper = _binomial_interval(rate, n_approved if n_approved else 1)
+            rate = float(curve[age - 1])
+            lower, upper = _interval(rate, n_approved, age, w, models)
             rows.append(
                 {
                     "cohort_week": w,
@@ -276,12 +365,8 @@ def build_trajectory_grid(
                     "cdr_upper_90": upper,
                 }
             )
+        out_parts.append(enforce_monotone_cohort(pd.DataFrame(rows)))
 
-    filled = pd.DataFrame(rows)
-    out_parts = []
-    for w in range(1, N_COHORT_WEEKS + 1):
-        part = filled.loc[filled["cohort_week"] == w].copy()
-        out_parts.append(enforce_monotone_cohort(part))
     return pd.concat(out_parts, ignore_index=True)
 
 

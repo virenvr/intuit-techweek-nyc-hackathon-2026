@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
-"""Generate submission_A_decisions.csv using NPV-based approve/decline policy.
+"""Generate submission_A_decisions.csv — PRD-aligned NPV underwriting pipeline.
 
-Windows (PowerShell):
-    python -m venv .venv
-    .venv\\Scripts\\Activate.ps1
-    pip install -r requirements.txt
-    python run_deliverable_a.py --output-dir submission
+Pipeline (PRD technical roadmap)
+-------------------------------
+1. Feature engineering (application-time features)
+2. Calibrated probability model (HistGradientBoosting + isotonic regression)
+3. Wilson score 90% confidence intervals (deterministic, bounded in [0, 1])
+4. NPV engine — E[NPV] = (1-p)*NPV_repay + p*NPV_default
+5. Decision engine — approve iff E[NPV] > 0
+6. Validation metrics + submission file
 
-Unix:
-    python run_deliverable_a.py --output-dir submission
+Hackathon submission schema (validate_submission.py):
+    applicant_id, decision (0/1), predicted_pd, pd_lower_90, pd_upper_90
+Plus PRD column: expected_npv
+
+Run:
+    dobby/bin/python run_deliverable_a.py --output-dir submission
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ import numpy as np
 import pandas as pd
 
 from src.constants import DATA_DIR
+from src.evaluation import evaluate_validation
 from src.models import (
     UnderwritingModels,
     pd_intervals,
@@ -28,10 +36,10 @@ from src.models import (
     predict_pd,
     predict_recovery_amount,
     train_models,
-    validation_interval_coverage,
 )
-from src.npv_policy import approval_decision, expected_npv, portfolio_realized_profit, tune_npv_threshold
+from src.npv_policy import approval_decision, expected_npv, portfolio_realized_profit
 
+RANDOM_SEED = 42
 
 SELECTION_BIAS_NOTE = """
 Selection bias (Deliverable D — Section 1)
@@ -47,8 +55,9 @@ declined segments are therefore extrapolations, not directly observed.
 Mitigations in this pipeline:
   - Train PD only on approved_matured_mask rows
   - Isotonic calibration on validation (same label population)
-  - NPV threshold tuned on validation realized profit (not AUC alone)
-  - Ablation: prior_underwriter_score excluded unless it improves val profit
+  - ENPV > 0 decision rule with portfolio metrics on validation
+  - Wilson score 90% PD intervals (k = p-hat * n, n = approved+matured train size)
+  - Ablation: prior_underwriter_score excluded unless it improves val ENPV
   - Per-applicant default-day and dollar recovery models on default history
 
 Remaining gap: no full reject-inference / IPW — document in writeup limitations.
@@ -62,53 +71,56 @@ def load_data(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
     return train, validation, test
 
 
-def score_expected_npv(models: UnderwritingModels, applicants: pd.DataFrame) -> np.ndarray:
+def score_applicants(
+    models: UnderwritingModels,
+    applicants: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Predict PD, intervals, and expected NPV for each applicant."""
     pd_hat = predict_pd(models, applicants)
+    pd_lower, pd_upper = pd_intervals(models, applicants, pd_hat)
     default_day = predict_default_day(models, applicants)
     recovery = predict_recovery_amount(models, applicants)
-    return expected_npv(
+    enpv = expected_npv(
         applicants["requested_amount"],
         pd_hat,
         default_day,
         recovery,
     )
+    return pd_hat, pd_lower, pd_upper, enpv, default_day
 
 
-def fit_and_tune(
+def train_pipeline(
     train: pd.DataFrame,
     validation: pd.DataFrame,
     *,
     include_prior_underwriter_score: bool,
-) -> tuple[UnderwritingModels, float, float, float]:
-    """Train models, tune NPV threshold on validation profit, return metrics."""
-    models = train_models(
+    interval_method: str,
+    n_bootstrap: int,
+    npv_threshold: float,
+    pd_interval_n: int | None,
+) -> UnderwritingModels:
+    """Phase 2–3: train calibrated PD, intervals, timing, and recovery models."""
+    return train_models(
         train,
         validation,
         include_prior_underwriter_score=include_prior_underwriter_score,
+        npv_threshold=npv_threshold,
+        interval_method=interval_method,
+        n_bootstrap=n_bootstrap,
+        pd_interval_n=pd_interval_n,
+        random_state=RANDOM_SEED,
     )
-    enpv = score_expected_npv(models, validation)
-    best_tau, best_profit = tune_npv_threshold(validation, enpv)
-    models.npv_threshold = best_tau
-    coverage = validation_interval_coverage(models, validation)
-    return models, best_profit, best_tau, coverage
 
 
 def build_submission(
     models: UnderwritingModels,
     applicants: pd.DataFrame,
 ) -> pd.DataFrame:
-    pd_hat = predict_pd(models, applicants)
-    pd_lower, pd_upper = pd_intervals(models, applicants, pd_hat)
-    default_day = predict_default_day(models, applicants)
-    recovery = predict_recovery_amount(models, applicants)
-    npv = expected_npv(
-        applicants["requested_amount"],
-        pd_hat,
-        default_day,
-        recovery,
-    )
-    decisions = approval_decision(npv, npv_threshold=models.npv_threshold)
+    """Phase 5–6: score applicants and apply ENPV decision rule."""
+    pd_hat, pd_lower, pd_upper, enpv, _ = score_applicants(models, applicants)
+    decisions = approval_decision(enpv, npv_threshold=models.npv_threshold)
 
+    # Hackathon schema + PRD expected_npv column.
     return pd.DataFrame(
         {
             "applicant_id": applicants["applicant_id"],
@@ -116,6 +128,7 @@ def build_submission(
             "predicted_pd": pd_hat,
             "pd_lower_90": pd_lower,
             "pd_upper_90": pd_upper,
+            "expected_npv": enpv,
         }
     )
 
@@ -126,7 +139,12 @@ def write_methodology_log(
     chosen_prior_score: bool,
     profit_without: float,
     profit_with: float,
-    best_tau: float,
+    enpv_without: float,
+    enpv_with: float,
+    npv_threshold: float,
+    interval_method: str,
+    n_bootstrap: int,
+    pd_interval_n: int,
     coverage: float,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -135,61 +153,187 @@ def write_methodology_log(
         f"# Deliverable A methodology log ({stamp})\n\n"
         f"{SELECTION_BIAS_NOTE.strip()}\n\n"
         f"## Ablation: prior_underwriter_score\n"
-        f"- Validation profit WITHOUT prior score: ${profit_without:,.0f}\n"
-        f"- Validation profit WITH prior score:    ${profit_with:,.0f}\n"
+        f"- Validation portfolio E[NPV] WITHOUT prior score: ${enpv_without:,.0f}\n"
+        f"- Validation portfolio E[NPV] WITH prior score:    ${enpv_with:,.0f}\n"
+        f"- Validation realized profit WITHOUT: ${profit_without:,.0f}\n"
+        f"- Validation realized profit WITH:    ${profit_with:,.0f}\n"
         f"- Selected config: {'WITH' if chosen_prior_score else 'WITHOUT'} "
         f"prior_underwriter_score\n\n"
-        f"## Policy tuning\n"
-        f"- NPV threshold (tau): ${best_tau:,.2f}  (approve if E[NPV] > tau)\n"
+        f"## Policy (PRD FR5)\n"
+        f"- Decision rule: approve iff E[NPV] > {npv_threshold:,.2f}\n"
+        f"- Interval method: {interval_method}"
+        + (
+            f" (Wilson score, n={pd_interval_n:,}, z=1.645, k=p-hat*n)"
+            if interval_method == "wilson"
+            else (f" (N={n_bootstrap})" if interval_method == "bootstrap" else "")
+        )
+        + f"\n"
         f"- Validation interval coverage (binary y in [lower, upper]): {coverage:.1%}\n"
+        f"- Random seed: {RANDOM_SEED}\n"
     )
     path.write_text(body, encoding="utf-8")
 
 
+def write_evaluation_report(
+    path: Path,
+    metrics: dict[str, float],
+    *,
+    interval_method: str,
+    n_bootstrap: int,
+    pd_interval_n: int,
+    npv_threshold: float,
+) -> None:
+    """PRD acceptance-criteria evaluation summary."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [
+        f"# Deliverable A evaluation report ({stamp})",
+        "",
+        "## Classification metrics",
+        f"- Log loss:    {metrics.get('log_loss', float('nan')):.4f}",
+        f"- AUC-ROC:     {metrics.get('auc_roc', float('nan')):.4f}",
+        f"- Brier score: {metrics.get('brier_score', float('nan')):.4f}",
+        "",
+        "## Calibration metrics",
+        f"- Expected Calibration Error (ECE): {metrics.get('ece', float('nan')):.4f}",
+        "",
+        "## Interval metrics",
+        f"- Method: {interval_method}"
+        + (
+            f" (Wilson score, n={pd_interval_n:,}, z=1.645)"
+            if interval_method == "wilson"
+            else (f" (N={n_bootstrap} bootstrap models)" if interval_method == "bootstrap" else "")
+        ),
+        f"- Coverage rate (target 88–92%): {metrics.get('interval_coverage', float('nan')):.1%}",
+        "",
+        "## Business metrics",
+        f"- Approval rate: {metrics.get('approval_rate', float('nan')):.1%}",
+        f"- Mean predicted PD: {metrics.get('mean_predicted_pd', float('nan')):.3f}",
+        f"- Portfolio E[NPV] (approved): ${metrics.get('portfolio_expected_npv', float('nan')):,.0f}",
+        f"- Portfolio realized profit (validation): "
+        f"${metrics.get('portfolio_realized_profit', float('nan')):,.0f}",
+        f"- NPV threshold: ${npv_threshold:,.2f}",
+        "",
+        "## Reproducibility",
+        f"- Random seed: {RANDOM_SEED}",
+        f"- Feature version: src/feature_engineering.py (application-time)",
+        f"- Model: HistGradientBoostingClassifier + IsotonicRegression",
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def evaluate_config(
+    models: UnderwritingModels,
+    validation: pd.DataFrame,
+) -> tuple[dict[str, float], float]:
+    """Score validation set and compute PRD metrics."""
+    pd_hat, pd_lower, pd_upper, enpv, _ = score_applicants(models, validation)
+    decisions = approval_decision(enpv, npv_threshold=models.npv_threshold)
+    realized = portfolio_realized_profit(validation, decisions)
+    metrics = evaluate_validation(
+        validation,
+        pd_hat=pd_hat,
+        pd_lower=pd_lower,
+        pd_upper=pd_upper,
+        expected_npv_values=enpv,
+        decisions=decisions,
+        realized_profit=realized,
+    )
+    return metrics, realized
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build Deliverable A submission.")
-    parser.add_argument(
-        "--data-dir",
-        type=Path,
-        default=Path(DATA_DIR),
-        help="Directory containing train/validation/test CSV files.",
+    parser = argparse.ArgumentParser(
+        description="Build Deliverable A submission (PRD-aligned NPV pipeline)."
     )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("submission"),
-        help="Folder for submission_A_decisions.csv",
-    )
+    parser.add_argument("--data-dir", type=Path, default=Path(DATA_DIR))
+    parser.add_argument("--output-dir", type=Path, default=Path("submission"))
     parser.add_argument(
         "--methodology-log",
         type=Path,
         default=Path("docs/deliverable_a_methodology.md"),
-        help="Write selection-bias note and ablation results for writeup Section 1.",
+    )
+    parser.add_argument(
+        "--evaluation-report",
+        type=Path,
+        default=Path("docs/deliverable_a_evaluation.md"),
+    )
+    parser.add_argument(
+        "--interval-method",
+        choices=("wilson", "bootstrap", "residual"),
+        default="wilson",
+        help="90%% interval method: Wilson score (default), bootstrap, or residual quantile.",
+    )
+    parser.add_argument(
+        "--pd-interval-n",
+        type=int,
+        default=None,
+        help="Effective n for Wilson intervals (default: approved+matured train count).",
+    )
+    parser.add_argument(
+        "--n-bootstrap",
+        type=int,
+        default=25,
+        help="Number of bootstrap PD models when --interval-method=bootstrap.",
+    )
+    parser.add_argument(
+        "--npv-threshold",
+        type=float,
+        default=0.0,
+        help="Approve iff E[NPV] > threshold (PRD default: 0).",
     )
     args = parser.parse_args()
 
     train, validation, test = load_data(args.data_dir)
-    print("Training ablation: without prior_underwriter_score...")
-    models_no_prior, profit_no, tau_no, cov_no = fit_and_tune(
-        train, validation, include_prior_underwriter_score=False
-    )
-    print("Training ablation: with prior_underwriter_score...")
-    models_yes, profit_yes, tau_yes, cov_yes = fit_and_tune(
-        train, validation, include_prior_underwriter_score=True
-    )
 
-    if profit_yes > profit_no:
+    print(
+        f"Training pipeline (interval={args.interval_method}, "
+        f"tau={args.npv_threshold:,.2f})..."
+    )
+    print("  Ablation: without prior_underwriter_score...")
+    models_no_prior = train_pipeline(
+        train,
+        validation,
+        include_prior_underwriter_score=False,
+        interval_method=args.interval_method,
+        n_bootstrap=args.n_bootstrap,
+        npv_threshold=args.npv_threshold,
+        pd_interval_n=args.pd_interval_n,
+    )
+    metrics_no, profit_no = evaluate_config(models_no_prior, validation)
+
+    print("  Ablation: with prior_underwriter_score...")
+    models_yes = train_pipeline(
+        train,
+        validation,
+        include_prior_underwriter_score=True,
+        interval_method=args.interval_method,
+        n_bootstrap=args.n_bootstrap,
+        npv_threshold=args.npv_threshold,
+        pd_interval_n=args.pd_interval_n,
+    )
+    metrics_yes, profit_yes = evaluate_config(models_yes, validation)
+
+    if metrics_yes["portfolio_expected_npv"] > metrics_no["portfolio_expected_npv"]:
         models = models_yes
         chosen_prior = True
-        best_profit, best_tau, coverage = profit_yes, tau_yes, cov_yes
+        metrics = metrics_yes
+        best_profit = profit_yes
+        enpv_no = metrics_no["portfolio_expected_npv"]
+        enpv_yes = metrics_yes["portfolio_expected_npv"]
     else:
         models = models_no_prior
         chosen_prior = False
-        best_profit, best_tau, coverage = profit_no, tau_no, cov_no
+        metrics = metrics_no
+        best_profit = profit_no
+        enpv_no = metrics_no["portfolio_expected_npv"]
+        enpv_yes = metrics_yes["portfolio_expected_npv"]
 
     print(
-        f"Ablation winner: {'WITH' if chosen_prior else 'WITHOUT'} prior_underwriter_score "
-        f"(val profit ${best_profit:,.0f}, tau=${best_tau:,.2f}, coverage={coverage:.1%})"
+        f"Ablation winner: {'WITH' if chosen_prior else 'WITHOUT'} prior_underwriter_score | "
+        f"val E[NPV]=${metrics['portfolio_expected_npv']:,.0f} | "
+        f"coverage={metrics['interval_coverage']:.1%} | "
+        f"AUC={metrics['auc_roc']:.3f}"
     )
 
     write_methodology_log(
@@ -197,10 +341,24 @@ def main() -> None:
         chosen_prior_score=chosen_prior,
         profit_without=profit_no,
         profit_with=profit_yes,
-        best_tau=best_tau,
-        coverage=coverage,
+        enpv_without=enpv_no,
+        enpv_with=enpv_yes,
+        npv_threshold=args.npv_threshold,
+        interval_method=args.interval_method,
+        n_bootstrap=args.n_bootstrap,
+        pd_interval_n=models.pd_interval_n,
+        coverage=metrics["interval_coverage"],
+    )
+    write_evaluation_report(
+        args.evaluation_report,
+        metrics,
+        interval_method=args.interval_method,
+        n_bootstrap=args.n_bootstrap,
+        pd_interval_n=models.pd_interval_n,
+        npv_threshold=args.npv_threshold,
     )
     print(f"Wrote methodology log: {args.methodology_log}")
+    print(f"Wrote evaluation report: {args.evaluation_report}")
 
     scoring = pd.concat([validation, test], ignore_index=True)
     submission = build_submission(models, scoring)
@@ -209,15 +367,12 @@ def main() -> None:
     out_path = args.output_dir / "submission_A_decisions.csv"
     submission.to_csv(out_path, index=False)
 
-    val_sub = submission.iloc[: len(validation)]
-    val_decisions = val_sub["decision"].to_numpy()
-    realized = portfolio_realized_profit(validation, val_decisions)
-
     print(f"Wrote {out_path} ({len(submission):,} rows)")
     print(
         f"Approve rate: {submission['decision'].mean():.1%} | "
         f"Mean PD: {submission['predicted_pd'].mean():.3f} | "
-        f"Val realized profit: ${realized:,.0f}"
+        f"Mean E[NPV]: ${submission['expected_npv'].mean():,.0f} | "
+        f"Val realized profit: ${best_profit:,.0f}"
     )
 
 
