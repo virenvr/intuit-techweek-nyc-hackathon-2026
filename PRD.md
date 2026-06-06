@@ -2,7 +2,7 @@
 
 > **Product Requirements Document** for internal team alignment before v2 changes.  
 > **Authority:** Official format/rules → [`README.md`](README.md). Strategy/math depth → [`goals.MD`](goals.MD).  
-> **Status:** Day 2 — v1 shipped for A & B; v2 planning in progress  
+> **Status:** Day 2 — v1 shipped for A, B & C; v2 tuning in progress  
 > **Last updated:** 2026-06-06
 
 ---
@@ -55,6 +55,8 @@ Deliverable D (writeup PDF) is referenced only where A–C choices must match th
 | [`goals.MD`](goals.MD) | Team bible — NPV math, strategy, ops checklist |
 | [`docs/deliverable_a_methodology.md`](docs/deliverable_a_methodology.md) | Auto-generated A run log |
 | [`docs/deliverable_b_methodology.md`](docs/deliverable_b_methodology.md) | Auto-generated B run log |
+| [`docs/DELIVERABLE_C_STEPS.md`](docs/DELIVERABLE_C_STEPS.md) | C implementation steps |
+| [`docs/deliverable_c_methodology.md`](docs/deliverable_c_methodology.md) | Auto-generated C run log |
 
 ---
 
@@ -95,7 +97,8 @@ Move from **“validator passes”** to **“outputs look like real underwriting
 |------|--------|
 | A pipeline | `run_deliverable_a.py` — NPV policy, ablation, isotonic PD, per-row interval attempt |
 | B pipeline | `run_deliverable_b.py` — cohort assign, timing models, 169 grid, monotonicity |
-| Validator | A + B pass format checks when both present in `submission/` |
+| C pipeline | `run_deliverable_c.py` — intervention registry, do() logic, 900 CF rows |
+| Validator | A + B + C pass format checks (`submission_D_writeup.pdf` still pending) |
 | Git hygiene | `.gitignore` excludes `dobby/`, `.venv/`, submissions, extracted CSVs |
 | Methodology logs | Auto-written under `docs/` on each run |
 
@@ -122,9 +125,12 @@ Move from **“validator passes”** to **“outputs look like real underwriting
 
 #### Deliverable C
 
-| Gap | Status |
-|-----|--------|
-| Not started | **Blocker** for full validator PASS |
+| Gap | v1 evidence | Severity |
+|-----|-------------|----------|
+| Intervals too wide | Mean width ~0.84; many bounds at 0/1 | **High** |
+| Directional sanity | Risk-up ~65%; risk-down ~46% on val proxy | Medium |
+| Non-intervenable queries | 174/900 use failsafe blend path | Medium (document) |
+| Causal depth | No double ML / causal forest yet | Medium |
 
 ### Team assessment (Day 2)
 
@@ -192,7 +198,7 @@ Non-negotiable from [`README.md`](README.md):
 |----|----------|---------|
 | O1 | τ constraints | τ ≥ 0; max approve rate on val; profit − λ·PD penalty |
 | O2 | `prior_underwriter_score` in A | Keep vs drop for cleaner independent policy |
-| O3 | Interval method | Mondrian conformal, decile conformal, quantile PD |
+| O3 | Interval method | Wilson (B cohort rates), Mondrian conformal / decile (A/C), quantile PD |
 | O4 | C causal approach | Double ML, causal forest, structural buckets by feature group |
 | O5 | Non-intervenable C queries | Document + best-effort vs exclude from training signal |
 
@@ -382,12 +388,12 @@ Located in `src/constants.py` and `TrajectoryModels`:
 ### Phase map
 
 ```
-Phase 0 ✅  v1 A + B pipelines, gitignore, docs
-Phase 1 🔄  PRD agreed + A v2 (policy + intervals)     ← WE ARE HERE
+Phase 0 ✅  v1 A + B + C pipelines, gitignore, docs, PRD
+Phase 1 🔄  A v2 (policy + intervals) + Wilson B intervals   ← WE ARE HERE
 Phase 2 ⏳  B v2 rerun on new A
-Phase 3 ⏳  C v1 + intervals
-Phase 4 ⏳  D writeup draft (§1–§3 while building C)
-Phase 5 ⏳  Full validator PASS + upload
+Phase 3 ⏳  C v2 (intervals + causal method)
+Phase 4 ⏳  D writeup draft (§1–§3)
+Phase 5 ⏳  Full validator PASS + upload (incl. PDF)
 ```
 
 ### Recommended ownership
@@ -454,7 +460,8 @@ These are **intentionally out of scope** for this PRD and v2 unless time remains
 |------|-----|----------|-------|
 | 2026-06-05 | D1–D7 | See [§5](#5-shared-principles--design-decisions) | Carried from v1 |
 | 2026-06-06 | PRD-1 | Adopt this PRD before major A/B/C changes | Team Day 2 alignment |
-| 2026-06-06 | — | v1 A/B accepted as baseline, not final | Teammate review: bounds/patterns weak |
+| 2026-06-06 | — | v1 A/B/C accepted as baseline, not final | Teammate review: bounds/patterns weak |
+| 2026-06-06 | — | Merged teammate PRD + pushed C v1 code | Remote sync |
 
 *Add a row when O1–O6 are resolved.*
 
@@ -471,6 +478,7 @@ pip install -r requirements.txt
 # Generate deliverables
 python run_deliverable_a.py --output-dir submission
 python run_deliverable_b.py --output-dir submission
+python run_deliverable_c.py --output-dir submission
 
 # Validate
 python validate_submission.py submission
