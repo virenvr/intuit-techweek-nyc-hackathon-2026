@@ -12,7 +12,6 @@ Pipeline (PRD technical roadmap)
 
 Hackathon submission schema (validate_submission.py):
     applicant_id, decision (0/1), predicted_pd, pd_lower_90, pd_upper_90
-Plus PRD column: expected_npv
 
 Run:
     dobby/bin/python run_deliverable_a.py --output-dir submission
@@ -115,22 +114,21 @@ def train_pipeline(
 def build_submission(
     models: UnderwritingModels,
     applicants: pd.DataFrame,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, np.ndarray]:
     """Phase 5–6: score applicants and apply ENPV decision rule."""
     pd_hat, pd_lower, pd_upper, enpv, _ = score_applicants(models, applicants)
     decisions = approval_decision(enpv, npv_threshold=models.npv_threshold)
 
-    # Hackathon schema + PRD expected_npv column.
-    return pd.DataFrame(
+    submission = pd.DataFrame(
         {
             "applicant_id": applicants["applicant_id"],
             "decision": decisions,
             "predicted_pd": pd_hat,
             "pd_lower_90": pd_lower,
             "pd_upper_90": pd_upper,
-            "expected_npv": enpv,
         }
     )
+    return submission, enpv
 
 
 def write_methodology_log(
@@ -361,7 +359,7 @@ def main() -> None:
     print(f"Wrote evaluation report: {args.evaluation_report}")
 
     scoring = pd.concat([validation, test], ignore_index=True)
-    submission = build_submission(models, scoring)
+    submission, enpv = build_submission(models, scoring)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     out_path = args.output_dir / "submission_A_decisions.csv"
@@ -371,7 +369,7 @@ def main() -> None:
     print(
         f"Approve rate: {submission['decision'].mean():.1%} | "
         f"Mean PD: {submission['predicted_pd'].mean():.3f} | "
-        f"Mean E[NPV]: ${submission['expected_npv'].mean():,.0f} | "
+        f"Mean E[NPV]: ${enpv.mean():,.0f} | "
         f"Val realized profit: ${best_profit:,.0f}"
     )
 

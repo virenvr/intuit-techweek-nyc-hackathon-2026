@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from src.constants import DATA_DICTIONARY_PATH
+from src.feature_engineering import requested_to_observed_revenue
 
 BANK_FEED_FEATURES = frozenset(
     {
@@ -60,8 +61,7 @@ def recompute_derived_context_fields(df: pd.DataFrame) -> pd.DataFrame:
         "requested_amount" in out.columns
         and "observed_monthly_revenue_avg_3mo" in out.columns
     ):
-        denom = out["observed_monthly_revenue_avg_3mo"].replace(0, np.nan)
-        out["requested_amount_to_observed_revenue"] = out["requested_amount"] / denom
+        out["requested_amount_to_observed_revenue"] = requested_to_observed_revenue(out)
     return out
 
 

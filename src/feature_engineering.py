@@ -87,6 +87,14 @@ def _safe_ratio(
     return out.fillna(fill_value)
 
 
+def requested_to_observed_revenue(df: pd.DataFrame) -> pd.Series:
+    """R / observed monthly revenue — single source of truth for train and do()."""
+    return _safe_ratio(
+        df["requested_amount"],
+        df["observed_monthly_revenue_avg_3mo"],
+    )
+
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """Build model matrix from raw application rows."""
     out = df.copy()
@@ -122,6 +130,14 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out["stated_vs_vintage_time_gap"] = (
         out["stated_time_in_business"] - out["vintage_years"]
     ).abs()
+
+    if (
+        "requested_amount" in out.columns
+        and "observed_monthly_revenue_avg_3mo" in out.columns
+    ):
+        out["requested_amount_to_observed_revenue"] = requested_to_observed_revenue(
+            out
+        )
 
     return out
 

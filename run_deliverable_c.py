@@ -99,6 +99,7 @@ def write_methodology_log(
         [
             "",
             "## Intervals",
+            f"- Method: Wilson score (z=1.645, k=p-hat*n, local n from calibration support)",
             f"- Mean interval width (all): {stats.mean_interval_width:.3f}",
             f"- Mean interval width (non-intervenable): "
             f"{stats.mean_interval_width_non_intervenable:.3f}",
@@ -145,6 +146,7 @@ def main() -> None:
         train,
         validation,
         include_prior_underwriter_score=args.include_prior_underwriter_score,
+        interval_method="wilson",
     )
 
     print(f"Predicting {len(queries)} counterfactuals...")

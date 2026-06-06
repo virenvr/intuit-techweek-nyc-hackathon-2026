@@ -13,7 +13,27 @@ from src.constants import (
     NON_INTERVENABLE_INTERVAL_MULTIPLIER,
 )
 from src.interventions import apply_do, classify_queries, load_feature_registry
-from src.models import UnderwritingModels, pd_intervals, predict_pd
+from src.models import UnderwritingModels, predict_pd
+from src.wilson import wilson_score_interval
+
+
+def _wilson_cf_intervals(
+    models: UnderwritingModels,
+    pd_hat: float,
+) -> tuple[float, float]:
+    """90% Wilson score bounds for a counterfactual PD (k = p-hat * n)."""
+    pd_arr = np.asarray([pd_hat], dtype=float)
+    level_n = models.pd_level_n
+    if level_n:
+        fallback = float(np.median(list(level_n.values())))
+        key = float(np.round(pd_hat, 9))
+        n_eff = max(level_n.get(key, fallback), 1.0)
+    else:
+        n_eff = float(max(models.pd_interval_n, 1))
+    lower, upper = wilson_score_interval(pd_arr, n_eff)
+    lower = float(np.minimum(lower[0], pd_hat))
+    upper = float(np.maximum(upper[0], pd_hat))
+    return lower, upper
 
 
 @dataclass
@@ -74,17 +94,16 @@ def predict_counterfactuals(
 
         if q.intervenable:
             pd_hat = pd_cf_raw
-            lower, upper = pd_intervals(models, cf_df, np.array([pd_hat]))
-            lower, upper = float(lower[0]), float(upper[0])
+            lower, upper = _wilson_cf_intervals(models, pd_hat)
         else:
             # Non-intervenable trap: do() is ill-defined — blend toward observational PD.
             alpha = float(np.clip(non_intervenable_blend, 0.0, 1.0))
             pd_hat = (1.0 - alpha) * pd_cf_raw + alpha * pd_obs
-            lower, upper = pd_intervals(models, cf_df, np.array([pd_hat]))
+            lower, upper = _wilson_cf_intervals(models, pd_hat)
             pd_hat, lower, upper = _widen_interval(
                 pd_hat,
-                float(lower[0]),
-                float(upper[0]),
+                lower,
+                upper,
                 multiplier=non_intervenable_interval_multiplier,
             )
 

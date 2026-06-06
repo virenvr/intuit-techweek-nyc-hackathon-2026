@@ -8,7 +8,7 @@ Steps covered
 3-4. Train discrete-time default-by-day-7a models + historical KM failsafes
 5. Aggregate cohort-level cumulative default rates
 6. Enforce monotonicity within each cohort
-7. Attach binomial 90% intervals
+7. Attach Wilson score 90% intervals (k = CDR * n_approved)
 8. Write submission_B_trajectory.csv and run format checks
 
 Windows (PowerShell):
@@ -98,6 +98,7 @@ def write_b_log(
             f"- blend_weight (thin cohorts): {models.blend_weight}",
             "- Empty cohort -> historical KM only",
             "- Monotonicity: cummax enforced per cohort",
+            "- Intervals: Wilson score (z=1.645, n = approved per cohort)",
         ]
     )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

@@ -31,12 +31,16 @@ def assign_cohort_week(
     Rows outside the 13 scoring cohort windows receive NA. Set strict=False to allow
     that (historical train data). Set strict=True for validation/test scoring rows.
     """
-    ts = pd.to_datetime(df[timestamp_col])
+    # Normalize to calendar dates so midnight boundaries do not spill across weeks.
+    ts = pd.to_datetime(df[timestamp_col]).dt.normalize()
     cohort = pd.Series(pd.NA, index=df.index, dtype="Int64")
 
     for row in cohort_defs.itertuples(index=False):
-        in_range = (ts >= row.start_date) & (ts <= row.end_date)
-        cohort.loc[in_range] = int(row.cohort_week)
+        start = pd.Timestamp(row.start_date).normalize()
+        end = pd.Timestamp(row.end_date).normalize()
+        in_range = (ts >= start) & (ts <= end)
+        # First match wins — prevents silent overwrite if definition windows overlap.
+        cohort.loc[in_range & cohort.isna()] = int(row.cohort_week)
 
     missing = cohort.isna().sum()
     if strict and missing:

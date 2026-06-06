@@ -34,6 +34,13 @@ def evaluate_pd_predictions(
 ) -> dict[str, float]:
     """Primary classification and calibration metrics (PRD evaluation section)."""
     y = np.asarray(y_true, dtype=int)
+    if len(y) == 0:
+        return {
+            "log_loss": float("nan"),
+            "brier_score": float("nan"),
+            "ece": float("nan"),
+            "auc_roc": float("nan"),
+        }
     p = np.clip(np.asarray(y_prob, dtype=float), 1e-6, 1.0 - 1e-6)
     out: dict[str, float] = {
         "log_loss": float(log_loss(y, p)),
@@ -52,8 +59,17 @@ def interval_coverage(
     lower: np.ndarray,
     upper: np.ndarray,
 ) -> float:
-    """Fraction of outcomes captured by [lower, upper] (target ~90%)."""
+    """Fraction of binary outcomes y in {0, 1} captured by [lower, upper].
+
+    This measures whether the realized default indicator falls inside the
+    reported PD band. It is *not* the same as nominal 90% predictive coverage
+    for a continuous probability — tight Wilson/residual bands will often fail
+    to bracket the realized {0, 1} outcome. Treat as a sanity check, not a
+    calibration target to overfit.
+    """
     y = np.asarray(y_true, dtype=float)
+    if len(y) == 0:
+        return float("nan")
     lo = np.asarray(lower, dtype=float)
     hi = np.asarray(upper, dtype=float)
     return float(np.mean((y >= lo) & (y <= hi)))
@@ -82,6 +98,20 @@ def evaluate_validation(
     """Aggregate validation metrics for the evaluation report."""
     mask = approved_matured_mask(validation)
     labeled = validation.loc[mask]
+    if labeled.empty:
+        d = np.asarray(decisions, dtype=int)
+        return {
+            "log_loss": float("nan"),
+            "brier_score": float("nan"),
+            "ece": float("nan"),
+            "auc_roc": float("nan"),
+            "interval_coverage": float("nan"),
+            "approval_rate": float(np.mean(d)) if len(d) else float("nan"),
+            "portfolio_expected_npv": portfolio_expected_npv(expected_npv_values, d),
+            "portfolio_realized_profit": float(realized_profit),
+            "mean_predicted_pd": float(np.mean(pd_hat)) if len(pd_hat) else float("nan"),
+        }
+
     y = labeled["default_flag"].astype(int).to_numpy()
     idx = labeled.index
     pos = validation.index.get_indexer(idx)

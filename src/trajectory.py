@@ -8,9 +8,7 @@ v2 contract
   construction and removes the "flat tail then age-13 spike" artifact.
 - Aggregate to cohort-level CDR using Deliverable A approve decisions.
 - Failsafe to historical Kaplan-Meier curves when a cohort has too few approvals.
-- Attach intervals that actually reflect uncertainty: a binomial sampling term
-  (cohort size), a Greenwood shape term (grows as the at-risk set thins with age),
-  and an extrapolation inflation that grows past the observed boundary 14 - w.
+- Attach 90% Wilson score intervals on each cohort CDR (k = rate * n_approved).
 
 NOTE: this preserves the public interface used by run_deliverable_b.py
 (`train_trajectory_models`, `build_trajectory_grid`, `merge_decisions`,
@@ -34,12 +32,11 @@ from sklearn.preprocessing import OneHotEncoder
 
 from src.constants import (
     DEFAULT_WINDOW_DAYS,
-    INTERVAL_Z_SCORE,
     MIN_APPROVED_COHORT_SIZE,
-    MIN_INTERVAL_HALF_WIDTH,
     N_COHORT_WEEKS,
     N_LOAN_AGE_WEEKS,
 )
+from src.wilson import wilson_score_interval
 from src.feature_engineering import (
     ENGINEERED_FEATURES,
     PRIOR_LENDER_FEATURES,
@@ -175,10 +172,13 @@ def _individual_cdr_matrix(models: TrajectoryModels, df: pd.DataFrame) -> np.nda
     feats = _feature_matrix(df, models.feature_cols)
     x_prep = models.prep.transform(feats)
     n = x_prep.shape[0]
-    hazards = np.zeros((n, N_LOAN_AGE_WEEKS))
-    for k in range(1, N_LOAN_AGE_WEEKS + 1):
-        x_age = np.hstack([x_prep, np.full((n, 1), float(k))])
-        hazards[:, k - 1] = models.clf.predict_proba(x_age)[:, 1]
+    if n == 0:
+        return np.zeros((0, N_LOAN_AGE_WEEKS))
+
+    ages = np.tile(np.arange(1, N_LOAN_AGE_WEEKS + 1, dtype=float), n)
+    x_rep = np.repeat(x_prep, N_LOAN_AGE_WEEKS, axis=0)
+    x_all = np.hstack([x_rep, ages.reshape(-1, 1)])
+    hazards = models.clf.predict_proba(x_all)[:, 1].reshape(n, N_LOAN_AGE_WEEKS)
     survival = np.cumprod(1.0 - hazards, axis=1)
     return 1.0 - survival
 
@@ -280,18 +280,14 @@ def _interval(
     cohort_week: int,
     models: TrajectoryModels,
 ) -> tuple[float, float]:
-    """90% interval: binomial sampling + Greenwood shape + extrapolation inflation."""
+    """90% Wilson score interval for cohort CDR (k = rate * n_approved, z=1.645)."""
+    _ = (age, cohort_week, models)  # signature kept for callers
+    rate = float(np.clip(rate, 0.0, 1.0))
     n_eff = max(int(n), 1)
-    var_binom = max(rate * (1.0 - rate), 0.0) / n_eff
-    var_shape = float(models.greenwood_var[age - 1])
-    half = INTERVAL_Z_SCORE * np.sqrt(var_binom + var_shape)
-
-    # Weeks of forecast past the observed boundary (cohort w observed to age 14-w).
-    extrap_weeks = max(0, age - (N_COHORT_WEEKS + 1 - cohort_week))
-    half *= 1.0 + models.extrap_inflation_per_week * extrap_weeks
-
-    half = max(MIN_INTERVAL_HALF_WIDTH, half)
-    return float(np.clip(rate - half, 0.0, 1.0)), float(np.clip(rate + half, 0.0, 1.0))
+    lower, upper = wilson_score_interval(rate, n_eff)
+    lower = float(np.minimum(lower, rate))
+    upper = float(np.maximum(upper, rate))
+    return lower, upper
 
 
 def enforce_monotone_cohort(curve: pd.DataFrame) -> pd.DataFrame:

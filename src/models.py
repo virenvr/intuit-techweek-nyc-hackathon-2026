@@ -41,16 +41,20 @@ class UnderwritingModels:
     pd_model: Pipeline
     pd_calibrator: IsotonicRegression
     recovery_model: HistGradientBoostingRegressor
-    default_day_model: HistGradientBoostingRegressor
+    default_day_model: HistGradientBoostingRegressor | None
     residual_quantile_model: Pipeline | None
     npv_threshold: float
     feature_cols: list[str]
     include_prior_underwriter_score: bool
     default_day_mean: float
     min_interval_half_width: float = 0.02
-    interval_method: str = "wilson"
+    interval_method: str = "residual"
     bootstrap_ensemble: list[PDCalibratedModel] | None = None
     pd_interval_n: int = 1
+    # Maps each isotonic calibration level -> number of calibration points supporting
+    # it. Used to give Wilson intervals an honest *local* sample size instead of the
+    # global training-set size (which collapsed every interval to ~1/20th its width).
+    pd_level_n: dict[float, int] | None = None
 
 
 def _feature_matrix(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
@@ -87,19 +91,12 @@ def _build_preprocessor(feature_cols: list[str]) -> ColumnTransformer:
     )
 
 
-def _make_pd_classifier(*, random_state: int) -> Pipeline:
-    return Pipeline(
-        steps=[
-            (
-                "clf",
-                HistGradientBoostingClassifier(
-                    max_depth=6,
-                    learning_rate=0.08,
-                    max_iter=200,
-                    random_state=random_state,
-                ),
-            ),
-        ]
+def _make_pd_classifier(*, random_state: int) -> HistGradientBoostingClassifier:
+    return HistGradientBoostingClassifier(
+        max_depth=6,
+        learning_rate=0.08,
+        max_iter=200,
+        random_state=random_state,
     )
 
 
@@ -109,26 +106,36 @@ def _fit_pd_calibrated(
     feature_cols: list[str],
     *,
     random_state: int,
+    calibration_df: pd.DataFrame | None = None,
 ) -> tuple[Pipeline, IsotonicRegression]:
-    """Fit one PD classifier + isotonic calibrator on validation labels."""
+    """Fit one PD classifier + isotonic calibrator.
+
+    The classifier is trained on `train_pd`. The calibrator is fit on
+    `calibration_df` if supplied, otherwise on `validation`. Passing a calibration
+    fold that is disjoint from the reporting/validation fold removes the optimistic
+    bias from fitting and evaluating calibration on the same rows.
+    """
     x_train = _feature_matrix(train_pd, feature_cols)
     y_pd = train_pd["default_flag"].astype(int)
     pd_model = Pipeline(
         steps=[
             ("prep", _build_preprocessor(feature_cols)),
-            ("clf", _make_pd_classifier(random_state=random_state).named_steps["clf"]),
+            ("clf", _make_pd_classifier(random_state=random_state)),
         ]
     )
     pd_model.fit(x_train, y_pd)
 
-    val_mask = approved_matured_mask(validation)
-    x_val_all = _feature_matrix(validation, feature_cols)
-    val_pd_raw = pd_model.predict_proba(x_val_all)[:, 1]
+    cal_source = calibration_df if calibration_df is not None else validation
+    cal_mask = approved_matured_mask(cal_source)
+    x_cal_all = _feature_matrix(cal_source, feature_cols)
+    cal_pd_raw = pd_model.predict_proba(x_cal_all)[:, 1]
     calibrator = IsotonicRegression(out_of_bounds="clip")
-    calibrator.fit(
-        val_pd_raw[val_mask],
-        validation.loc[val_mask, "default_flag"].astype(int),
-    )
+    cal_y = cal_source.loc[cal_mask, "default_flag"].astype(int)
+    if int(cal_mask.sum()) >= 2 and cal_y.nunique() > 1:
+        calibrator.fit(cal_pd_raw[cal_mask.to_numpy()], cal_y)
+    else:
+        # Degenerate calibration fold: fall back to identity so predict_pd still works.
+        calibrator.fit(np.array([0.0, 1.0]), np.array([0.0, 1.0]))
     return pd_model, calibrator
 
 
@@ -161,66 +168,97 @@ def train_models(
     train: pd.DataFrame,
     validation: pd.DataFrame,
     *,
+    calibration: pd.DataFrame | None = None,
     include_prior_underwriter_score: bool = False,
     npv_threshold: float = 0.0,
-    interval_method: str = "wilson",
+    interval_method: str = "residual",
     n_bootstrap: int = 25,
     pd_interval_n: int | None = None,
     random_state: int = 42,
 ) -> UnderwritingModels:
-    """Train PD (approved+matured), timing, recovery, and uncertainty models."""
+    """Train PD (approved+matured), timing, recovery, and uncertainty models.
+
+    If `calibration` is provided it is used to fit the isotonic calibrator and the
+    interval support, leaving `validation` purely for reporting. This avoids the
+    same-fold bias where calibration is fit and evaluated on identical rows.
+    """
     feature_cols = feature_columns(
         include_prior_underwriter_score=include_prior_underwriter_score
     )
     train_mask = approved_matured_mask(train)
     train_pd = train.loc[train_mask].copy()
+    cal_source = calibration if calibration is not None else validation
 
     pd_model, calibrator = _fit_pd_calibrated(
         train_pd,
         validation,
         feature_cols,
         random_state=random_state,
+        calibration_df=cal_source,
     )
 
-    val_mask = approved_matured_mask(validation)
-    x_val_all = _feature_matrix(validation, feature_cols)
-    val_pd_raw = pd_model.predict_proba(x_val_all)[:, 1]
+    cal_mask = approved_matured_mask(cal_source)
+    x_cal_all = _feature_matrix(cal_source, feature_cols)
+    cal_pd_raw = pd_model.predict_proba(x_cal_all)[:, 1]
+    val_mask = cal_mask
+    x_val_all = x_cal_all
+    val_pd_raw = cal_pd_raw
+
+    # Honest local sample size per calibration level (isotonic step), used by Wilson.
+    calibrated_levels = np.clip(calibrator.predict(cal_pd_raw[cal_mask.to_numpy()]), 0.0, 1.0)
+    levels, counts = np.unique(np.round(calibrated_levels, 9), return_counts=True)
+    pd_level_n = {float(lv): int(c) for lv, c in zip(levels, counts)}
 
     default_rows = train_pd[train_pd["default_flag"] == 1].copy()
-    default_day_mean = float(default_rows["days_to_default"].mean())
-
-    default_day_model = HistGradientBoostingRegressor(
-        max_depth=5,
-        learning_rate=0.08,
-        max_iter=150,
-        random_state=42,
-    )
-    default_day_model.fit(
-        _feature_matrix(default_rows, feature_cols),
-        default_rows["days_to_default"].astype(float),
-    )
-
-    recovery_model = HistGradientBoostingRegressor(
-        max_depth=5,
-        learning_rate=0.08,
-        max_iter=150,
-        random_state=42,
-    )
-    recovery_model.fit(
-        _feature_matrix(default_rows, feature_cols),
-        default_rows["final_recovered_amount"].astype(float),
-    )
+    default_day_model: HistGradientBoostingRegressor | None
+    if default_rows.empty:
+        default_day_mean = float(DEFAULT_WINDOW_DAYS / 2.0)
+        default_day_model = None
+        recovery_model = HistGradientBoostingRegressor(
+            max_depth=5,
+            learning_rate=0.08,
+            max_iter=150,
+            random_state=random_state,
+        )
+        recovery_model.fit(
+            _feature_matrix(train_pd, feature_cols),
+            np.zeros(len(train_pd), dtype=float),
+        )
+    else:
+        default_day_mean = float(default_rows["days_to_default"].mean())
+        default_day_model = HistGradientBoostingRegressor(
+            max_depth=5,
+            learning_rate=0.08,
+            max_iter=150,
+            random_state=random_state,
+        )
+        default_day_model.fit(
+            _feature_matrix(default_rows, feature_cols),
+            default_rows["days_to_default"].astype(float),
+        )
+        recovery_model = HistGradientBoostingRegressor(
+            max_depth=5,
+            learning_rate=0.08,
+            max_iter=150,
+            random_state=random_state,
+        )
+        recovery_model.fit(
+            _feature_matrix(default_rows, feature_cols),
+            default_rows["final_recovered_amount"].astype(float),
+        )
 
     bootstrap_ensemble: list[PDCalibratedModel] | None = None
     residual_quantile_model: Pipeline | None = None
     interval_n = int(pd_interval_n if pd_interval_n is not None else len(train_pd))
 
-    if interval_method == "bootstrap":
-        x_val_labeled = _feature_matrix(validation.loc[val_mask], feature_cols)
-        calibrated_val = calibrator.predict(val_pd_raw[val_mask])
-        y_val = validation.loc[val_mask, "default_flag"].astype(int).to_numpy()
-        abs_residual = np.abs(y_val - calibrated_val)
-        residual_quantile_model = Pipeline(
+    def _fit_residual_quantile_model() -> Pipeline:
+        """Per-row 0.90-quantile of |y - p_hat|, fit on the calibration fold."""
+        labeled = cal_source.loc[cal_mask]
+        x_labeled = _feature_matrix(labeled, feature_cols)
+        calibrated = np.clip(calibrator.predict(val_pd_raw[cal_mask.to_numpy()]), 0.0, 1.0)
+        y = labeled["default_flag"].astype(int).to_numpy()
+        abs_residual = np.abs(y - calibrated)
+        model = Pipeline(
             steps=[
                 ("prep", _build_preprocessor(feature_cols)),
                 (
@@ -236,36 +274,25 @@ def train_models(
                 ),
             ]
         )
-        residual_quantile_model.fit(x_val_labeled, abs_residual)
+        model.fit(x_labeled, abs_residual)
+        return model
+
+    if interval_method == "bootstrap":
+        residual_quantile_model = _fit_residual_quantile_model()
         bootstrap_ensemble = _train_bootstrap_ensemble(
             train_pd,
-            validation,
+            cal_source,
             feature_cols,
             n_bootstrap=n_bootstrap,
             seed=random_state,
         )
     elif interval_method == "residual":
-        x_val_labeled = _feature_matrix(validation.loc[val_mask], feature_cols)
-        calibrated_val = calibrator.predict(val_pd_raw[val_mask])
-        y_val = validation.loc[val_mask, "default_flag"].astype(int).to_numpy()
-        abs_residual = np.abs(y_val - calibrated_val)
-        residual_quantile_model = Pipeline(
-            steps=[
-                ("prep", _build_preprocessor(feature_cols)),
-                (
-                    "reg",
-                    GradientBoostingRegressor(
-                        loss="quantile",
-                        alpha=0.90,
-                        max_depth=4,
-                        learning_rate=0.08,
-                        n_estimators=120,
-                        random_state=random_state,
-                    ),
-                ),
-            ]
+        residual_quantile_model = _fit_residual_quantile_model()
+    elif interval_method != "wilson":
+        raise ValueError(
+            f"Unknown interval_method {interval_method!r}; "
+            "expected 'residual', 'bootstrap', or 'wilson'."
         )
-        residual_quantile_model.fit(x_val_labeled, abs_residual)
 
     return UnderwritingModels(
         pd_model=pd_model,
@@ -280,6 +307,7 @@ def train_models(
         interval_method=interval_method,
         bootstrap_ensemble=bootstrap_ensemble,
         pd_interval_n=interval_n,
+        pd_level_n=pd_level_n,
     )
 
 
@@ -289,6 +317,11 @@ def predict_pd(models: UnderwritingModels, df: pd.DataFrame) -> np.ndarray:
 
 
 def predict_default_day(models: UnderwritingModels, df: pd.DataFrame) -> np.ndarray:
+    if models.default_day_model is None:
+        n = len(df)
+        return np.clip(
+            np.full(n, models.default_day_mean), 1.0, float(DEFAULT_WINDOW_DAYS)
+        )
     pred = models.default_day_model.predict(_feature_matrix(df, models.feature_cols))
     return np.clip(pred, 1.0, float(DEFAULT_WINDOW_DAYS))
 
@@ -305,9 +338,24 @@ def _wilson_pd_intervals(
     models: UnderwritingModels,
     pd_hat: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """90% Wilson score intervals from p-hat and effective group size n."""
+    """90% Wilson score intervals using an honest *local* effective sample size.
+
+    The previous version used a single global n (the full training-set size), which
+    made every interval ~1/sqrt(N) too tight. Here each row's n is the number of
+    calibration points sharing its isotonic level; rows whose level is unseen fall
+    back to the median level count (a conservative, non-degenerate floor).
+    """
     pd_hat = np.asarray(pd_hat, dtype=float)
-    lower, upper = wilson_score_interval(pd_hat, models.pd_interval_n)
+    level_n = models.pd_level_n
+    if level_n:
+        fallback = float(np.median(list(level_n.values())))
+        keys = np.round(pd_hat, 9)
+        n_eff = np.array([level_n.get(float(k), fallback) for k in keys], dtype=float)
+    else:
+        # No calibration support map: fall back to the configured interval n.
+        n_eff = np.full(pd_hat.shape, float(max(models.pd_interval_n, 1)))
+    n_eff = np.maximum(n_eff, 1.0)
+    lower, upper = wilson_score_interval(pd_hat, n_eff)
     lower = np.minimum(lower, pd_hat)
     upper = np.maximum(upper, pd_hat)
     return lower, upper

@@ -1,4 +1,4 @@
-# Deliverable A methodology log (2026-06-06 15:59 UTC)
+# Deliverable A methodology log (2026-06-06 17:24 UTC)
 
 Selection bias (Deliverable D — Section 1)
 ------------------------------------------
@@ -21,14 +21,14 @@ Mitigations in this pipeline:
 Remaining gap: no full reject-inference / IPW — document in writeup limitations.
 
 ## Ablation: prior_underwriter_score
-- Validation portfolio E[NPV] WITHOUT prior score: $6,022,150
-- Validation portfolio E[NPV] WITH prior score:    $6,185,247
-- Validation realized profit WITHOUT: $23,887,270
-- Validation realized profit WITH:    $24,888,015
+- Validation portfolio E[NPV] WITHOUT prior score: $6,094,581
+- Validation portfolio E[NPV] WITH prior score:    $6,176,714
+- Validation realized profit WITHOUT: $24,244,196
+- Validation realized profit WITH:    $25,503,173
 - Selected config: WITH prior_underwriter_score
 
 ## Policy (PRD FR5)
 - Decision rule: approve iff E[NPV] > 0.00
 - Interval method: wilson (Wilson score, n=51,722, z=1.645, k=p-hat*n)
-- Validation interval coverage (binary y in [lower, upper]): 2.4%
+- Validation interval coverage (binary y in [lower, upper]): 1.7%
 - Random seed: 42

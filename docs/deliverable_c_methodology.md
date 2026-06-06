@@ -1,4 +1,4 @@
-# Deliverable C v1 log (2026-06-06 15:24 UTC)
+# Deliverable C v1 log (2026-06-06 17:27 UTC)
 
 Deliverable C — causal traps (writeup Section 3)
 ------------------------------------------------
@@ -38,14 +38,15 @@ reject-inference consistency with Deliverable A selection bias.
 - employee_count_bucket: 14
 - prior_loans_default_count: 13
 - vintage_years: 12
-- intended_use_of_funds: 12
 - sector: 12
-- bookkeeping_recency_days: 11
+- intended_use_of_funds: 12
 - geography_region: 11
+- bookkeeping_recency_days: 11
 
 ## Intervals
-- Mean interval width (all): 0.839
-- Mean interval width (non-intervenable): 0.821
+- Method: Wilson score (z=1.645, k=p-hat*n, local n from calibration support)
+- Mean interval width (all): 0.120
+- Mean interval width (non-intervenable): 0.175
 
 ## v1 failsafes
 - NON_INTERVENABLE_BLEND, NON_INTERVENABLE_INTERVAL_MULTIPLIER in src/constants.py

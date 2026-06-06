@@ -7,6 +7,11 @@ import pandas as pd
 
 from src.constants import APR, DEFAULT_WINDOW_DAYS, ORIGINATION_FEE_RATE, TERM_DAYS
 
+# Threshold tuning: require a real profit lift before moving off break-even (tau=0).
+THRESHOLD_IMPROVEMENT_FRAC = 0.005
+THRESHOLD_IMPROVEMENT_MIN = 1_000.0
+THRESHOLD_PROFIT_TIE_EPS = 1.0
+
 
 def loan_cashflows(requested_amount: pd.Series | np.ndarray) -> dict[str, np.ndarray]:
     """Compute fixed product cash-flow components for each loan."""
@@ -95,8 +100,18 @@ def tune_npv_threshold(
     expected_npv_values: np.ndarray,
     *,
     thresholds: np.ndarray | None = None,
+    anchor_tau: float = 0.0,
+    improvement_frac: float = THRESHOLD_IMPROVEMENT_FRAC,
+    improvement_min: float = THRESHOLD_IMPROVEMENT_MIN,
+    profit_tie_eps: float = THRESHOLD_PROFIT_TIE_EPS,
 ) -> tuple[float, float]:
-    """Pick threshold maximizing realized portfolio profit on labeled validation rows."""
+    """Pick threshold maximizing validation profit with anti-overfit guardrails.
+
+    Starts from the break-even anchor (tau=0 by default). A candidate threshold
+    replaces the incumbent only if it beats the best profit by a meaningful margin
+    (relative + absolute floor). On near-ties, prefer the threshold closest to zero
+    so tuning does not chase fold noise with extreme cutoffs.
+    """
     if thresholds is None:
         enpv = np.asarray(expected_npv_values, dtype=float)
         lo = float(np.quantile(enpv, 0.05))
@@ -104,12 +119,23 @@ def tune_npv_threshold(
         thresholds = np.linspace(lo, hi, 41)
 
     enpv = np.asarray(expected_npv_values, dtype=float)
-    best_tau = 0.0
-    best_profit = -np.inf
+    anchor_tau = float(anchor_tau)
+    best_tau = anchor_tau
+    best_profit = portfolio_realized_profit(
+        df, approval_decision(enpv, npv_threshold=anchor_tau)
+    )
+    margin = max(improvement_min, improvement_frac * abs(best_profit))
+
     for tau in thresholds:
-        decisions = approval_decision(enpv, npv_threshold=float(tau))
-        profit = portfolio_realized_profit(df, decisions)
-        if profit > best_profit:
+        tau = float(tau)
+        profit = portfolio_realized_profit(
+            df, approval_decision(enpv, npv_threshold=tau)
+        )
+        if profit > best_profit + margin:
             best_profit = profit
-            best_tau = float(tau)
+            best_tau = tau
+        elif abs(profit - best_profit) <= profit_tie_eps and abs(tau) < abs(best_tau):
+            best_profit = profit
+            best_tau = tau
+
     return best_tau, best_profit
