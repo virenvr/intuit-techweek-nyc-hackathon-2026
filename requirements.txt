@@ -1,3 +1,4 @@
 # Minimal dependencies to read the dataset and run validate_submission.py.
 numpy>=1.26
 pandas>=2.2
+scikit-learn>=1.4
